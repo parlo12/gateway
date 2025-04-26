@@ -1,0 +1,10 @@
+# content-service/.dockerignore (and likewise auth-service/.dockerignore)
+
+# don’t include Git metadata
+.git
+.git/**
+
+# node modules, logs, temp files, etc
+node_modules
+npm-debug.log*
+yarn-error.log*
