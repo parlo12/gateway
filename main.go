@@ -5,56 +5,69 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 
 	"github.com/gin-gonic/gin"
 )
 
-// newProxy builds a reverse-proxy to the given target URL.
-func newProxy(target string) *httputil.ReverseProxy {
-	u, err := url.Parse(target)
-	if err != nil {
-		log.Fatalf("invalid proxy target %q: %v", target, err)
-	}
-	p := httputil.NewSingleHostReverseProxy(u)
+func main() {
+	// run Gin in release by default
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Use(gin.Logger(), gin.Recovery())
 
-	// rewrite incoming URL before forwarding
-	orig := p.Director
-	p.Director = func(req *http.Request) {
-		orig(req)
-		req.Host = u.Host
+	// config via env (can override in docker-compose)
+	gatewayPort := getEnv("GATEWAY_PORT", "8080")
+	authSvcURL := getEnv("AUTH_SERVICE_URL", "http://auth-service:8082")
+	contentSvcURL := getEnv("CONTENT_SERVICE_URL", "http://content-service:8083")
+
+	// health check
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "up"})
+	})
+
+	// build reverse-proxies
+	authProxy := mustNewProxy(authSvcURL)
+	contentProxy := mustNewProxy(contentSvcURL)
+
+	// proxy /signup and /login to auth-service
+	router.Any("/signup", wrapProxy(authProxy))
+	router.Any("/login", wrapProxy(authProxy))
+	// also proxy any /auth/... paths (to catch /auth/register, etc.)
+	router.Any("/auth/*proxyPath", wrapProxy(authProxy))
+
+	// proxy content endpoints
+	router.Any("/content/*proxyPath", wrapProxy(contentProxy))
+
+	log.Printf("▶ Gateway listening on :%s, forwarding auth→%s, content→%s",
+		gatewayPort, authSvcURL, contentSvcURL)
+
+	if err := router.Run(":" + gatewayPort); err != nil {
+		log.Fatalf("gateway failed: %v", err)
 	}
-	return p
 }
 
-func main() {
-	// build proxies
-	authProxy := newProxy("http://auth-service:8082")
-	contentProxy := newProxy("http://content-service:8083")
-
-	// we’ll use Gin just for routing, but hand off to the stdlib proxy
-	r := gin.Default()
-
-	// Health check
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok"})
-	})
-
-	// AUTH: everything under /auth/* → auth-service
-	r.Any("/auth/*proxyPath", gin.WrapH(authProxy))
-	// also forward root signup/login so clients can do POST /signup
-	r.Any("/signup", gin.WrapH(authProxy))
-	r.Any("/login", gin.WrapH(authProxy))
-
-	// CONTENT: everything under /content/* → content-service
-	r.Any("/content/*proxyPath", gin.WrapH(contentProxy))
-
-	// fallback 404
-	r.NoRoute(func(c *gin.Context) {
-		c.JSON(404, gin.H{"error": "not found"})
-	})
-
-	log.Println("Gateway listening on :8080")
-	if err := r.Run(":8080"); err != nil {
-		log.Fatalf("gateway error: %v", err)
+// mustNewProxy parses targetURL and returns a ReverseProxy or panics.
+func mustNewProxy(targetURL string) *httputil.ReverseProxy {
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		log.Fatalf("bad proxy URL %q: %v", targetURL, err)
 	}
+	return httputil.NewSingleHostReverseProxy(u)
+}
+
+// wrapProxy returns a Gin handler which delegates to the given proxy.
+func wrapProxy(p *httputil.ReverseProxy) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// you could rewrite path here if you need to strip prefixes
+		p.ServeHTTP(c.Writer, c.Request)
+	}
+}
+
+// getEnv reads an env var or returns the default.
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
